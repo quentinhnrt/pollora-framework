@@ -74,6 +74,17 @@ function managerMake(string $root, ?Container $app = null, ?Loader $loader = nul
     return new ThemeManager($app, Mockery::mock(ViewFinderInterface::class), $loader, $repo, $registrar, $console);
 }
 
+/**
+ * A container whose module asset manager takes any view path, for the tests that look at the parent chain only.
+ */
+function managerAppWithViewPaths(): Container
+{
+    $app = new ManagerTestContainer;
+    $app->instance(ModuleAssetManager::class, Mockery::mock(ModuleAssetManager::class)->shouldIgnoreMissing());
+
+    return $app;
+}
+
 describe('ThemeManager loading', function (): void {
     it('walks up the parent chain and registers every theme view path', function (): void {
         $root = managerThemesRoot();
@@ -109,6 +120,138 @@ describe('ThemeManager loading', function (): void {
         }
 
         expect($result)->toBe(['child', ['parent']]);
+    });
+
+    it('finds the parent of the active theme in the Template header when theme.json names none', function (): void {
+        $root = managerThemesRoot();
+        mkdir($root.'/child');
+        mkdir($root.'/parent');
+        file_put_contents($root.'/child/theme.json', '{}');
+        file_put_contents($root.'/parent/theme.json', '{}');
+        Functions\when('get_stylesheet')->justReturn('child');
+        Functions\when('get_template')->justReturn('parent');
+
+        $finder = Mockery::mock(ViewFinderInterface::class);
+        $finder->shouldReceive('addLocation')->once()->with($root.'/child/resources/views');
+        $finder->shouldReceive('addLocation')->once()->with($root.'/parent/resources/views');
+        $view = new class($finder)
+        {
+            public function __construct(private $finder) {}
+
+            public function getFinder()
+            {
+                return $this->finder;
+            }
+        };
+        $app = new ManagerTestContainer;
+        $app->instance('view', $view);
+
+        try {
+            $manager = managerMake($root, $app);
+            $manager->load('child');
+            $parents = array_map(fn (ThemeMetadata $t): string => $t->getName(), $manager->getParentThemes());
+        } finally {
+            managerRemove($root);
+        }
+
+        expect($parents)->toBe(['parent']);
+    });
+
+    it('prefers the parent theme.json names over the Template header', function (): void {
+        $root = managerThemesRoot();
+        mkdir($root.'/child');
+        mkdir($root.'/named');
+        mkdir($root.'/parent');
+        file_put_contents($root.'/child/theme.json', json_encode(['parent' => 'named']));
+        file_put_contents($root.'/named/theme.json', '{}');
+        file_put_contents($root.'/parent/theme.json', '{}');
+        Functions\when('get_stylesheet')->justReturn('child');
+        Functions\when('get_template')->justReturn('parent');
+
+        try {
+            $manager = managerMake($root, managerAppWithViewPaths());
+            $manager->load('child');
+            $parents = array_map(fn (ThemeMetadata $t): string => $t->getName(), $manager->getParentThemes());
+        } finally {
+            managerRemove($root);
+        }
+
+        expect($parents)->toBe(['named']);
+    });
+
+    it('adds no parent when the template is the active theme itself', function (): void {
+        $root = managerThemesRoot();
+        mkdir($root.'/solo');
+        file_put_contents($root.'/solo/theme.json', '{}');
+        Functions\when('get_stylesheet')->justReturn('solo');
+        Functions\when('get_template')->justReturn('solo');
+
+        try {
+            $manager = managerMake($root, managerAppWithViewPaths());
+            $manager->load('solo');
+            $parents = $manager->getParentThemes();
+        } finally {
+            managerRemove($root);
+        }
+
+        expect($parents)->toBe([]);
+    });
+
+    it('registers the parent view paths first when the module asset manager puts each path in front', function (): void {
+        $root = managerThemesRoot();
+        mkdir($root.'/child');
+        mkdir($root.'/parent');
+        file_put_contents($root.'/child/theme.json', json_encode(['parent' => 'parent']));
+        file_put_contents($root.'/parent/theme.json', '{}');
+
+        $assets = Mockery::mock(ModuleAssetManager::class);
+        $assets->shouldReceive('registerModuleViewPaths')->once()->with($root.'/parent', 'theme', 'parent')->ordered();
+        $assets->shouldReceive('registerModuleViewPaths')->once()->with($root.'/child', 'theme', 'child')->ordered();
+        $app = new ManagerTestContainer;
+        $app->instance(ModuleAssetManager::class, $assets);
+
+        try {
+            managerMake($root, $app)->load('child');
+        } finally {
+            managerRemove($root);
+        }
+    });
+
+    it('lists each parent once when the theme is loaded again', function (): void {
+        $root = managerThemesRoot();
+        mkdir($root.'/child');
+        mkdir($root.'/parent');
+        file_put_contents($root.'/child/theme.json', json_encode(['parent' => 'parent']));
+        file_put_contents($root.'/parent/theme.json', '{}');
+
+        try {
+            $manager = managerMake($root, managerAppWithViewPaths());
+            $manager->load('child');
+            $manager->load('child');
+            $parents = array_map(fn (ThemeMetadata $t): string => $t->getName(), $manager->getParentThemes());
+        } finally {
+            managerRemove($root);
+        }
+
+        expect($parents)->toBe(['parent']);
+    });
+
+    it('leaves the Template header alone for a theme that is not the active one', function (): void {
+        $root = managerThemesRoot();
+        mkdir($root.'/other');
+        file_put_contents($root.'/other/theme.json', '{}');
+        Functions\when('get_stylesheet')->justReturn('child');
+        Functions\when('get_template')->justReturn('parent');
+
+        try {
+            $manager = managerMake($root, managerAppWithViewPaths());
+            $manager->load('other');
+            $parents = $manager->getParentThemes();
+        } finally {
+            managerRemove($root);
+        }
+
+        expect($parents)->toBe([]);
     });
 
     it('registers view paths through the module asset manager when it is bound', function (): void {

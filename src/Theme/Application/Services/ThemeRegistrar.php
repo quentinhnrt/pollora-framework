@@ -5,7 +5,9 @@ declare(strict_types=1);
 namespace Pollora\Theme\Application\Services;
 
 use Illuminate\Foundation\Application;
+use Illuminate\Support\ServiceProvider;
 use Pollora\BlockPattern\UI\PatternComponent;
+use Pollora\Hook\Domain\Contract\Action;
 use Pollora\Modules\Domain\Contracts\ModuleDiscoveryOrchestratorInterface;
 use Pollora\Modules\Domain\Contracts\ModuleRepositoryInterface;
 use Pollora\Modules\Infrastructure\Services\ModuleAssetManager;
@@ -40,15 +42,43 @@ class ThemeRegistrar implements ThemeRegistrarInterface
     ) {}
 
     /**
-     * Register a theme as the active theme.
+     * Register a theme as the active theme, behind its parent theme when it has one.
+     *
+     * WordPress runs the `functions.php` of a child theme and then the one of its parent, and both
+     * call this method: the chain is registered the first time and the later calls return the
+     * active theme. The parent registers first, so the child's config files, views and providers
+     * come after and take precedence.
      */
     public function register(): ThemeModuleInterface
     {
+        if ($this->activeTheme instanceof ThemeModuleInterface) {
+            return $this->activeTheme;
+        }
+
         $themeName = get_stylesheet();
         $themePath = get_stylesheet_directory();
 
-        // Parse theme headers if not provided
-        $styleCssPath = rtrim((string) $themePath, '/').'/style.css';
+        $parent = $this->resolveParentTheme($themeName);
+
+        if ($parent !== null) {
+            $this->hookParentProviders($this->registerTheme($parent['name'], $parent['path'], false));
+        }
+
+        return $this->registerTheme($themeName, $themePath, true);
+    }
+
+    /**
+     * Register one theme of the chain.
+     *
+     * As under WordPress, the code of a theme belongs to that theme: the `theme` asset container
+     * points at the theme while it registers, so the assets its code declares come from its own
+     * build, and it ends up on the active theme. The theme initializer and the patterns, which
+     * already walk the parent chain, run for the active theme only.
+     */
+    private function registerTheme(string $themeName, string $themePath, bool $isActive): ThemeModuleInterface
+    {
+        // Parse theme headers
+        $styleCssPath = rtrim($themePath, '/').'/style.css';
         $themeData = $this->themeParser->parseThemeHeaders($styleCssPath);
 
         // Create the theme module
@@ -57,27 +87,39 @@ class ThemeRegistrar implements ThemeRegistrarInterface
         $theme->setHeaders($themeData);
         $theme->setEnabled(true);
 
-        // Register as the active theme
-        $this->activeTheme = $theme;
+        if ($isActive) {
+            // Register as the active theme
+            $this->activeTheme = $theme;
+        }
+
+        // The asset container comes first: the code discovered next declares its assets against it
+        $assetsReady = $this->setupThemeAssetContainers($theme);
 
         // Invalidate repository cache and discover structures
         $this->invalidateRepositoryCache();
-        $this->discoverThemeStructures($theme);
+
+        if ($isActive) {
+            $this->discoverThemeStructures($theme);
+        } else {
+            $this->registerWithBootOn($theme, fn () => $this->discoverThemeStructures($theme));
+        }
 
         // Load theme configuration
         $this->loadThemeConfiguration($theme);
 
         // Setup theme components
-        $this->setupThemeComponents($theme);
+        $this->setupThemeComponents($theme, $isActive);
 
-        // Setup theme assets and includes
-        $this->setupThemeAssets($theme);
+        // Load the includes of the theme
+        if ($assetsReady) {
+            $this->loadThemeIncludes($theme);
+        }
 
         // Load theme routes (api.php, web.php)
         $this->loadThemeRoutes($theme);
 
-        // Load theme view paths via ThemeManager
-        if ($this->app->has(ThemeService::class)) {
+        // Load theme view paths via ThemeManager, which walks the parent chain
+        if ($isActive && $this->app->has(ThemeService::class)) {
             $this->app->get(ThemeService::class)->load($themeName);
         }
 
@@ -86,6 +128,156 @@ class ThemeRegistrar implements ThemeRegistrarInterface
         $theme->boot();
 
         return $theme;
+    }
+
+    /**
+     * The parent of the active theme, from the `Template` header WordPress resolves.
+     *
+     * @return array{name: string, path: string}|null Null when the theme has no parent
+     */
+    private function resolveParentTheme(string $themeName): ?array
+    {
+        $template = get_template();
+
+        if ($template === '' || $template === $themeName) {
+            return null;
+        }
+
+        return ['name' => $template, 'path' => get_template_directory()];
+    }
+
+    /**
+     * The providers a theme lists in its config/providers.php.
+     *
+     * @return array<int, string>|null Null when the theme has no providers file
+     */
+    private function readProviders(string $themePath): ?array
+    {
+        $file = rtrim($themePath, '/').'/config/providers.php';
+
+        if (! is_file($file)) {
+            return null;
+        }
+
+        try {
+            $providers = require $file;
+        } catch (\Throwable $throwable) {
+            $this->logError('Failed to read the theme providers: '.$throwable->getMessage());
+
+            return null;
+        }
+
+        return is_array($providers) ? array_values($providers) : [];
+    }
+
+    /**
+     * Register the providers a parent lists, when the theme initializer registers the ones of the active theme.
+     *
+     * The initializer reads `theme.providers`, which holds the list of the last theme that loaded
+     * its config: the child's. The parent's list is registered here, on the same hook and before
+     * it, with the `theme` asset container on the parent so its providers declare assets from the
+     * parent's build; the container goes back to the active theme afterwards.
+     */
+    private function hookParentProviders(ThemeModuleInterface $parent): void
+    {
+        $providers = $this->readProviders($parent->getPath());
+
+        if ($providers === null || $providers === [] || ! $this->app->has(Action::class)) {
+            return;
+        }
+
+        $this->app->get(Action::class)->add(
+            'after_setup_theme',
+            fn () => $this->registerParentProviders($parent, $providers),
+            1
+        );
+    }
+
+    /**
+     * @param  array<int, string>  $providers
+     */
+    private function registerParentProviders(ThemeModuleInterface $parent, array $providers): void
+    {
+        /** @var Application $app */
+        $app = $this->app->has('app') ? $this->app->get('app') : $this->app;
+
+        $this->pointThemeContainerAt($parent);
+
+        try {
+            foreach ($providers as $provider) {
+                try {
+                    $this->pointThemeContainerAtWhileBooting($app->register($provider), $parent);
+                } catch (\Throwable $throwable) {
+                    $this->logError(sprintf('Failed to register the provider %s of the theme %s: %s', $provider, $parent->getName(), $throwable->getMessage()));
+                }
+            }
+        } finally {
+            if ($this->activeTheme instanceof ThemeModuleInterface) {
+                $this->pointThemeContainerAt($this->activeTheme);
+            }
+        }
+    }
+
+    /**
+     * Run a registration that may register providers, and keep each of them booting with `theme` on the given parent.
+     *
+     * The discovery of a theme registers the service providers it finds in `app/`.
+     */
+    private function registerWithBootOn(ThemeModuleInterface $parent, \Closure $registration): void
+    {
+        /** @var Application $app */
+        $app = $this->app->has('app') ? $this->app->get('app') : $this->app;
+
+        if (! method_exists($app, 'getLoadedProviders') || ! method_exists($app, 'getProvider')) {
+            $registration();
+
+            return;
+        }
+
+        $before = array_keys($app->getLoadedProviders());
+
+        $registration();
+
+        foreach (array_diff(array_keys($app->getLoadedProviders()), $before) as $class) {
+            $this->pointThemeContainerAtWhileBooting($app->getProvider($class), $parent);
+        }
+    }
+
+    /**
+     * Keep the `theme` asset container on the parent while its provider boots.
+     *
+     * WordPress loads the theme before the Laravel application has booted, so a provider
+     * registered here boots later, when `theme` is the active theme's again: it would declare
+     * the parent's assets against the child's build.
+     */
+    private function pointThemeContainerAtWhileBooting(mixed $provider, ThemeModuleInterface $parent): void
+    {
+        if (! $provider instanceof ServiceProvider) {
+            return;
+        }
+
+        $provider->booting(fn () => $this->pointThemeContainerAt($parent));
+        $provider->booted(function (): void {
+            if ($this->activeTheme instanceof ThemeModuleInterface) {
+                $this->pointThemeContainerAt($this->activeTheme);
+            }
+        });
+    }
+
+    /**
+     * Make the `theme` asset container the one of the given theme.
+     */
+    private function pointThemeContainerAt(ThemeModuleInterface $theme): void
+    {
+        if (! $this->app->has(ModuleAssetManager::class)) {
+            return;
+        }
+
+        try {
+            $this->app->get(ModuleAssetManager::class)->setupModuleAssetContainer($theme->getLowerName(), $theme->getPath(), 'theme');
+        } catch (\Throwable $throwable) {
+            $this->logError('Failed to point the theme asset container at '.$theme->getName().': '.$throwable->getMessage());
+        }
     }
 
     /**
@@ -247,8 +439,11 @@ class ThemeRegistrar implements ThemeRegistrarInterface
 
     /**
      * Setup theme-specific components.
+     *
+     * The theme initializer and the patterns run for the active theme only: the initializer loads
+     * the theme chain and registers the providers, and the patterns already walk the parents.
      */
-    protected function setupThemeComponents(ThemeModuleInterface $theme): void
+    protected function setupThemeComponents(ThemeModuleInterface $theme, bool $isActive = true): void
     {
         if (! $this->app->has(ModuleComponentManager::class)) {
             return;
@@ -260,14 +455,16 @@ class ThemeRegistrar implements ThemeRegistrarInterface
 
             // Define theme-specific components
             $themeComponents = [
-                ThemeInitializer::class,
-                PatternComponent::class,
                 Menus::class,
                 Support::class,
                 Sidebar::class,
                 Templates::class,
                 ImageSize::class,
             ];
+
+            if ($isActive) {
+                array_unshift($themeComponents, ThemeInitializer::class, PatternComponent::class);
+            }
 
             $moduleId = 'theme.'.$theme->getLowerName();
 
@@ -297,24 +494,50 @@ class ThemeRegistrar implements ThemeRegistrarInterface
     }
 
     /**
-     * Setup theme assets and includes.
+     * Setup the asset containers and the view paths of a theme.
+     *
+     * `theme` is the container of the theme being registered, so the assets its code declares come
+     * from its own build; the active theme registers last and keeps it. Every theme also gets
+     * `theme.<name>`, to name a build from another theme's code. A parent registers before its
+     * child, and each view path goes in front of the others: the child's views win.
+     *
+     * @return bool Whether the containers are set up, and the includes can load
      */
-    protected function setupThemeAssets(ThemeModuleInterface $theme): void
+    protected function setupThemeAssetContainers(ThemeModuleInterface $theme): bool
     {
         if (! $this->app->has(ModuleAssetManager::class)) {
-            return;
+            return false;
         }
 
         try {
             /** @var ModuleAssetManager $assetManager */
             $assetManager = $this->app->get(ModuleAssetManager::class);
 
-            // Setup asset management (theme always uses 'theme' as container name)
+            // Setup asset management ('theme' is always the container name)
             $assetManager->setupModuleAssets(
                 $theme->getLowerName(),
                 $theme->getPath(),
                 'theme'
             );
+
+            $assetManager->setupThemeNamedContainer($theme->getLowerName(), $theme->getPath());
+        } catch (\Exception $exception) {
+            $this->logError('Failed to setup theme assets: '.$exception->getMessage());
+
+            return false;
+        }
+
+        return true;
+    }
+
+    /**
+     * Load the includes of a theme and register its Blade directives.
+     */
+    protected function loadThemeIncludes(ThemeModuleInterface $theme): void
+    {
+        try {
+            /** @var ModuleAssetManager $assetManager */
+            $assetManager = $this->app->get(ModuleAssetManager::class);
 
             // Load theme includes
             $assetManager->loadModuleIncludes($theme->getPath());

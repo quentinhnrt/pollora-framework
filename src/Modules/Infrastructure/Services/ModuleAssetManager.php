@@ -84,6 +84,34 @@ class ModuleAssetManager
     }
 
     /**
+     * Add the asset container a theme keeps under its own name, `theme.<name>`.
+     *
+     * The `theme` container belongs to the active theme, so a parent theme cannot
+     * register its assets there: a child theme's own registration replaces it. A
+     * parent names its assets with `theme.<name>` instead, which holds whether it
+     * runs alone or behind a child.
+     *
+     * @param  string  $themeName  Name of the theme (its directory name)
+     * @param  string  $themePath  Path to the theme
+     * @return string|null The container name, or null when there is no asset manager
+     */
+    public function setupThemeNamedContainer(string $themeName, string $themePath): ?string
+    {
+        if (! $this->app->bound(AssetManager::class)) {
+            return null;
+        }
+
+        /** @var AssetManager $assetManager */
+        $assetManager = $this->app->make(AssetManager::class);
+        $containerName = $this->getContainerName('theme').'.'.$themeName;
+
+        $assetManager->addContainer($containerName, $this->getAssetConfiguration($themeName, $themePath, 'theme'));
+        $this->moduleRoots[$containerName] = $themePath;
+
+        return $containerName;
+    }
+
+    /**
      * Root directory of every module whose assets were set up, keyed by asset container name.
      *
      * @return array<string, string>

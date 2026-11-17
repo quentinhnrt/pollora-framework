@@ -60,6 +60,7 @@ function setupDefaultWordPressStubs(): void
         'is_child_theme' => false,
         'get_stylesheet_directory' => '/path/to/theme',
         'get_stylesheet' => 'test-theme',
+        'get_template' => 'test-theme',
         'get_template_directory' => '/theme',
         'get_theme_file_path' => '/theme',
         'current_theme_supports' => false,

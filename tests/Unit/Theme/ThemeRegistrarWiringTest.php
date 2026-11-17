@@ -52,6 +52,7 @@ function registrarRun(Container $container, string $dir): ThemeModuleInterface
 {
     Functions\when('get_stylesheet')->justReturn('demo');
     Functions\when('get_stylesheet_directory')->justReturn($dir);
+    Functions\when('get_template')->justReturn('demo');
 
     $parser = Mockery::mock(WordPressThemeParser::class);
     $parser->shouldReceive('parseThemeHeaders')->andReturn(['Theme Name' => 'Demo']);
@@ -225,6 +226,7 @@ describe('ThemeRegistrar wiring', function (): void {
         $container = new Container;
         $assets = Mockery::mock(ModuleAssetManager::class);
         $assets->shouldReceive('setupModuleAssets')->once()->with('demo', $dir, 'theme');
+        $assets->shouldReceive('setupThemeNamedContainer')->once()->with('demo', $dir);
         $assets->shouldReceive('loadModuleIncludes')->once()->with($dir);
         $assets->shouldReceive('registerModuleBladeDirectives')->once()->with($dir);
         $container->instance(ModuleAssetManager::class, $assets);

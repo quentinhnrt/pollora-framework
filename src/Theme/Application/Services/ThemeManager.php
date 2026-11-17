@@ -130,7 +130,9 @@ class ThemeManager implements ThemeService
 
         $baseTheme = $this->createThemeMetadata($themeName, $this->getThemesPath());
         $this->theme = $baseTheme;
+        $this->parentThemes = [];
         $currentTheme = $baseTheme;
+        $chain = [];
 
         while (true) {
             if (! is_dir($currentTheme->getBasePath()) && ! $this->consoleDetectionService->isConsole()) {
@@ -139,9 +141,14 @@ class ThemeManager implements ThemeService
 
             $currentTheme->loadConfiguration();
 
-            $this->registerThemeDirectories($currentTheme);
+            $chain[] = $currentTheme;
 
             $parentThemeName = $currentTheme->getParentTheme();
+
+            // A theme.json that names no parent leaves it to the Template header of the active theme
+            if ($currentTheme === $baseTheme && in_array($parentThemeName, [null, '', '0'], true)) {
+                $parentThemeName = $this->templateParentOf($themeName);
+            }
 
             if (in_array($parentThemeName, [null, '', '0'], true)) {
                 break;
@@ -151,9 +158,31 @@ class ThemeManager implements ThemeService
             $this->parentThemes[] = $currentTheme;
         }
 
+        // The module asset manager puts each view path in front of the others, so the parent goes
+        // in first and the child ends up ahead of it; the finder's own addLocation appends.
+        $registrationOrder = $this->app->bound(ModuleAssetManager::class) ? array_reverse($chain) : $chain;
+
+        foreach ($registrationOrder as $theme) {
+            $this->registerThemeDirectories($theme);
+        }
+
         if ($this->localeLoader instanceof Loader) {
             $this->localeLoader->addNamespace($themeName, $baseTheme->getLanguagePath());
         }
+    }
+
+    /**
+     * The parent WordPress resolves from the Template header, when the theme is the active one.
+     */
+    private function templateParentOf(string $themeName): ?string
+    {
+        if (! function_exists('get_stylesheet') || ! function_exists('get_template') || get_stylesheet() !== $themeName) {
+            return null;
+        }
+
+        $template = get_template();
+
+        return $template !== '' && $template !== $themeName ? $template : null;
     }
 
     protected function registerThemeDirectories(ThemeMetadata $theme): void

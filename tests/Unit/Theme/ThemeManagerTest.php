@@ -38,6 +38,7 @@ test('loads a valid theme', function (): void {
     $app->shouldReceive('offsetGet')->with('config')->andReturn($config);
     $app->shouldReceive('runningInConsole')->andReturn(true);
     $app->shouldReceive('has')->withAnyArgs()->andReturn(true);
+    $app->shouldReceive('bound')->withAnyArgs()->andReturn(false);
     $app->shouldReceive('bind')->withAnyArgs()->andReturnNull();
     $moduleRepository = Mockery::mock(ModuleRepositoryInterface::class);
     $themeRegistrar = Mockery::mock(ThemeRegistrarInterface::class);

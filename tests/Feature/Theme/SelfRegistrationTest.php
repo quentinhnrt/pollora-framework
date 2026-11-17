@@ -8,6 +8,7 @@ use Pollora\Theme\Infrastructure\Services\WordPressThemeParser;
 
 beforeEach(function (): void {
     Brain\Monkey\Functions\when('get_stylesheet')->justReturn('my-theme');
+    Brain\Monkey\Functions\when('get_template')->justReturn('my-theme');
     Brain\Monkey\Functions\when('get_stylesheet_directory')->justReturn(__DIR__.'/fixtures/my-theme');
 
     // Create a minimal theme fixture
